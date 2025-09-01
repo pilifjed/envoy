@@ -740,8 +740,6 @@ TEST_P(IsContentTypeAllowedTest, Validate) {
   Http::TestResponseHeaderMapImpl headers{
       {":method", "get"}, {"content-length", "256"}, {"content-type", content_type}};
   doResponse(headers, should_compress, false);
-  EXPECT_EQ(should_compress ? 0 : 1,
-            stats_.counter("test.compressor.test.test.header_not_valid").value());
   EXPECT_EQ(should_compress, headers.has("vary"));
 }
 
@@ -881,6 +879,73 @@ TEST_P(HasCacheControlNoTransformTest, Validate) {
   EXPECT_EQ(is_compression_expected, headers.has("vary"));
 }
 
+TEST_F(CompressorFilterTest, EnvoyCompressionStatusHeaderContentLength) {
+  doRequestNoCompression({{":method", "get"}, {"accept-encoding", "test, deflate"}});
+  Http::TestResponseHeaderMapImpl headers{{":method", "get"}, {"content-length", "10"}};
+  doResponse(headers, false, false);
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"), "test;ContentLengthTooSmall");
+}
+
+TEST_F(CompressorFilterTest, EnvoyCompressionStatusHeaderContentType) {
+  doRequestNoCompression({{":method", "get"}, {"accept-encoding", "test, deflate"}});
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {"content-type", "image/jpeg"}};
+  doResponse(headers, false, false);
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"), "test;ContentTypeNotAllowed");
+}
+
+TEST_F(CompressorFilterTest, EnvoyCompressionStatusHeaderEtag) {
+  setUpFilter(R"EOF(
+{
+  "disable_on_etag_header": true,
+  "compressor_library": {
+     "name": "test",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+
+  doRequestNoCompression({{":method", "get"}, {"accept-encoding", "test, deflate"}});
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {"etag", "12345"}};
+  doResponse(headers, false, false);
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"), "test;EtagNotAllowed");
+}
+
+TEST_F(CompressorFilterTest, EnvoyCompressionStatusHeaderStatusCode) {
+  setUpFilter(R"EOF(
+{
+  "response_direction_config": {
+    "uncompressible_response_codes": [
+      206
+    ]
+  },
+  "compressor_library": {
+     "name": "test",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+  response_stats_prefix_ = "response.";
+
+  doRequestNoCompression({{":method", "get"}, {"accept-encoding", "test, deflate"}});
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {":status", "206"}};
+  doResponse(headers, false, false);
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"), "test;StatusCodeNotAllowed");
+}
+
+TEST_F(CompressorFilterTest, EnvoyCompressionStatusHeaderCompressed) {
+  doRequestNoCompression({{":method", "get"}, {"accept-encoding", "test, deflate"}});
+  Http::TestResponseHeaderMapImpl headers{{":method", "get"}, {"content-length", "256"}};
+  doResponse(headers, true, false);
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"), "test;Compressed;OriginalLength=256");
+}
+
 class IsMinimumContentLengthTest
     : public CompressorFilterTest,
       public testing::WithParamInterface<std::tuple<std::string, std::string, std::string, bool>> {
@@ -973,9 +1038,25 @@ TEST_P(InsertVaryHeaderTest, Validate) {
 
 class MultipleFiltersTest : public testing::Test {
 protected:
-  void SetUp() override {
+  void setUpFilters(const std::string& json1, const std::string& json2) {
     envoy::extensions::filters::http::compressor::v3::Compressor compressor;
-    TestUtility::loadFromJson(R"EOF(
+    TestUtility::loadFromJson(json1, compressor);
+    auto compressor_factory1 = std::make_unique<TestCompressorFactory>("test1");
+    compressor_factory1->setExpectedCompressCalls(0);
+    auto config1 = std::make_shared<CompressorFilterConfig>(
+        compressor, "test1.", *stats1_.rootScope(), runtime_, std::move(compressor_factory1));
+    filter1_ = std::make_unique<CompressorFilter>(config1);
+
+    TestUtility::loadFromJson(json2, compressor);
+    auto compressor_factory2 = std::make_unique<TestCompressorFactory>("test2");
+    compressor_factory2->setExpectedCompressCalls(0);
+    auto config2 = std::make_shared<CompressorFilterConfig>(
+        compressor, "test2.", *stats2_.rootScope(), runtime_, std::move(compressor_factory2));
+    filter2_ = std::make_unique<CompressorFilter>(config2);
+  }
+
+  void setUpDefaultFilters() {
+    setUpFilters(R"EOF(
 {
   "compressor_library": {
      "name": "test1",
@@ -985,14 +1066,7 @@ protected:
   }
 }
 )EOF",
-                              compressor);
-    auto compressor_factory1 = std::make_unique<TestCompressorFactory>("test1");
-    compressor_factory1->setExpectedCompressCalls(0);
-    auto config1 = std::make_shared<CompressorFilterConfig>(
-        compressor, "test1.", *stats1_.rootScope(), runtime_, std::move(compressor_factory1));
-    filter1_ = std::make_unique<CompressorFilter>(config1);
-
-    TestUtility::loadFromJson(R"EOF(
+                 R"EOF(
 {
   "compressor_library": {
      "name": "test2",
@@ -1001,13 +1075,7 @@ protected:
      }
   }
 }
-)EOF",
-                              compressor);
-    auto compressor_factory2 = std::make_unique<TestCompressorFactory>("test2");
-    compressor_factory2->setExpectedCompressCalls(0);
-    auto config2 = std::make_shared<CompressorFilterConfig>(
-        compressor, "test2.", *stats2_.rootScope(), runtime_, std::move(compressor_factory2));
-    filter2_ = std::make_unique<CompressorFilter>(config2);
+)EOF");
   }
 
   NiceMock<Runtime::MockLoader> runtime_;
@@ -1018,6 +1086,7 @@ protected:
 };
 
 TEST_F(MultipleFiltersTest, IndependentFilters) {
+  setUpDefaultFilters();
   // The compressor "test1" from an independent filter chain should not overshadow "test2".
   // The independence is simulated with different instances of DecoderFilterCallbacks set for
   // "test1" and "test2".
@@ -1045,6 +1114,7 @@ TEST_F(MultipleFiltersTest, IndependentFilters) {
 }
 
 TEST_F(MultipleFiltersTest, CacheEncodingDecision) {
+  setUpDefaultFilters();
   // Test that encoding decision is cached when used by multiple filters.
   NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
   filter1_->setDecoderFilterCallbacks(decoder_callbacks);
@@ -1070,6 +1140,7 @@ TEST_F(MultipleFiltersTest, CacheEncodingDecision) {
 }
 
 TEST_F(MultipleFiltersTest, UseFirstRegisteredFilterWhenWildcard) {
+  setUpDefaultFilters();
   // Test that first registered filter is used when handling wildcard.
   NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
   filter1_->setDecoderFilterCallbacks(decoder_callbacks);
@@ -1086,6 +1157,189 @@ TEST_F(MultipleFiltersTest, UseFirstRegisteredFilterWhenWildcard) {
   EXPECT_EQ(0, stats2_.counter("test2.compressor.test2.test.compressed").value());
   EXPECT_EQ(1, stats1_.counter("test1.compressor.test1.test.header_wildcard").value());
   EXPECT_EQ(1, stats2_.counter("test2.compressor.test2.test.header_wildcard").value());
+}
+
+TEST_F(MultipleFiltersTest, BothFiltersFail) {
+  setUpDefaultFilters();
+  // Test that when both filters fail to compress, the x-envoy-compression-status header
+  // contains entries for both.
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  filter1_->setDecoderFilterCallbacks(decoder_callbacks);
+  filter2_->setDecoderFilterCallbacks(decoder_callbacks);
+
+  Http::TestRequestHeaderMapImpl req_headers{{":method", "get"},
+                                             {"accept-encoding", "test1, test2"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->decodeHeaders(req_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->decodeHeaders(req_headers, false));
+  Http::TestResponseHeaderMapImpl headers{{":method", "get"}, {"content-length", "10"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->encodeHeaders(headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->encodeHeaders(headers, false));
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"),
+            "test1;ContentLengthTooSmall,test2;ContentLengthTooSmall");
+}
+
+TEST_F(MultipleFiltersTest, OneFilterFailsOneSucceeds) {
+  setUpFilters(R"EOF(
+{
+  "compressor_library": {
+     "name": "test1",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  },
+  "response_direction_config": {
+    "common_config": {
+      "content_type": [
+        "application/javascript"
+      ]
+    }
+  }
+}
+)EOF",
+               R"EOF(
+{
+  "compressor_library": {
+     "name": "test2",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  }
+}
+)EOF");
+  // Test that when one filter fails to compress and the other succeeds, the
+  // x-envoy-compression-status header contains entries for both.
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  filter1_->setDecoderFilterCallbacks(decoder_callbacks);
+  filter2_->setDecoderFilterCallbacks(decoder_callbacks);
+
+  Http::TestRequestHeaderMapImpl req_headers{{":method", "get"},
+                                             {"accept-encoding", "test1, test2"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->decodeHeaders(req_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->decodeHeaders(req_headers, false));
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {"content-type", "text/plain"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->encodeHeaders(headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->encodeHeaders(headers, false));
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"),
+            "test1;ContentTypeNotAllowed,test2;Compressed;OriginalLength=256");
+}
+
+TEST_F(MultipleFiltersTest, FirstFilterSucceedsSecondSkips) {
+  setUpDefaultFilters();
+  // Test that when the first filter compresses, the second filter skips.
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  filter1_->setDecoderFilterCallbacks(decoder_callbacks);
+  filter2_->setDecoderFilterCallbacks(decoder_callbacks);
+
+  Http::TestRequestHeaderMapImpl req_headers{{":method", "get"},
+                                             {"accept-encoding", "test1, test2"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->decodeHeaders(req_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->decodeHeaders(req_headers, false));
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {"content-type", "text/plain"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->encodeHeaders(headers, false));
+  // The second filter should not compress because the content-encoding header is already set.
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->encodeHeaders(headers, false));
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"), "test1;Compressed;OriginalLength=256");
+  EXPECT_EQ(headers.get_("content-encoding"), "test1");
+}
+
+TEST_F(MultipleFiltersTest, BothFiltersFailDifferentReasons) {
+  setUpFilters(R"EOF(
+{
+  "compressor_library": {
+     "name": "test1",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  },
+  "response_direction_config": {
+    "common_config": {
+      "min_content_length": 512
+    }
+  }
+}
+)EOF",
+               R"EOF(
+{
+  "compressor_library": {
+     "name": "test2",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  },
+  "response_direction_config": {
+    "common_config": {
+      "content_type": [
+        "application/javascript"
+      ]
+    }
+  }
+}
+)EOF");
+  // Test that when both filters fail to compress for different reasons, the
+  // x-envoy-compression-status header contains entries for both.
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  filter1_->setDecoderFilterCallbacks(decoder_callbacks);
+  filter2_->setDecoderFilterCallbacks(decoder_callbacks);
+
+  Http::TestRequestHeaderMapImpl req_headers{{":method", "get"},
+                                             {"accept-encoding", "test1, test2"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->decodeHeaders(req_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->decodeHeaders(req_headers, false));
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {"content-type", "text/plain"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->encodeHeaders(headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->encodeHeaders(headers, false));
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"),
+            "test1;ContentLengthTooSmall,test2;ContentTypeNotAllowed");
+}
+
+TEST_F(MultipleFiltersTest, BothFiltersFailEtagAndStatusCode) {
+  setUpFilters(R"EOF(
+{
+  "compressor_library": {
+     "name": "test1",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  },
+  "response_direction_config": {
+    "disable_on_etag_header": true
+  }
+}
+)EOF",
+               R"EOF(
+{
+  "compressor_library": {
+     "name": "test2",
+     "typed_config": {
+       "@type": "type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip"
+     }
+  },
+  "response_direction_config": {
+    "uncompressible_response_codes": [
+      206
+    ]
+  }
+}
+)EOF");
+  // Test that when both filters fail to compress for ETag and StatusCode reasons, the
+  // x-envoy-compression-status header contains entries for both.
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  filter1_->setDecoderFilterCallbacks(decoder_callbacks);
+  filter2_->setDecoderFilterCallbacks(decoder_callbacks);
+
+  Http::TestRequestHeaderMapImpl req_headers{{":method", "get"},
+                                             {"accept-encoding", "test1, test2"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->decodeHeaders(req_headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->decodeHeaders(req_headers, false));
+  Http::TestResponseHeaderMapImpl headers{
+      {":method", "get"}, {"content-length", "256"}, {"etag", "12345"}, {":status", "206"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter1_->encodeHeaders(headers, false));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter2_->encodeHeaders(headers, false));
+  EXPECT_EQ(headers.get_("x-envoy-compression-status"),
+            "test1;EtagNotAllowed,test2;StatusCodeNotAllowed");
 }
 
 // TODO(giantcroc): Refactor the code of MultipleFiltersTest and CompressorFilterTest due to many
