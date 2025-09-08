@@ -123,7 +123,8 @@ public:
   enum Type { ConnectionRemote = 0, DownstreamLocal, DownstreamDirectRemote, DownstreamRemote };
 
   // Single IP range constructor.
-  IPMatcher(const envoy::config::core::v3::CidrRange& range, Type type);
+  static absl::StatusOr<std::unique_ptr<IPMatcher>>
+  create(const envoy::config::core::v3::CidrRange& range, Type type);
 
   // Multiple IP ranges constructor.
   static absl::StatusOr<std::unique_ptr<IPMatcher>>
@@ -136,8 +137,8 @@ private:
   // Private constructor for LC Trie-based matcher.
   IPMatcher(std::unique_ptr<Network::LcTrie::LcTrie<bool>> trie, Type type);
 
-  // Extract IP address based on matcher type.
-  Network::Address::InstanceConstSharedPtr
+  // Helper method to extract IP address based on type, returning a reference to avoid copies.
+  const Network::Address::InstanceConstSharedPtr&
   extractIpAddress(const Network::Connection& connection, const StreamInfo::StreamInfo& info) const;
 
   std::unique_ptr<Network::LcTrie::LcTrie<bool>> trie_;
@@ -197,28 +198,23 @@ private:
  */
 class PolicyMatcher : public Matcher, NonCopyable {
 public:
-  PolicyMatcher(const envoy::config::rbac::v3::Policy& policy, Expr::Builder* builder,
+  PolicyMatcher(const envoy::config::rbac::v3::Policy& policy,
+                Expr::BuilderInstanceSharedPtr& builder,
                 ProtobufMessage::ValidationVisitor& validation_visitor,
                 Server::Configuration::CommonFactoryContext& context)
       : permissions_(policy.permissions(), validation_visitor, context),
-        principals_(policy.principals(), context), condition_([&policy]() {
+        principals_(policy.principals(), context),
+        expr_([&]() -> absl::optional<Expr::CompiledExpression> {
           if (policy.has_condition()) {
-            std::string serialized;
-            if (!policy.condition().SerializeToString(&serialized)) {
-              throw EnvoyException("Failed to serialize RBAC policy condition");
+            auto compiled = Expr::CompiledExpression::Create(builder, policy.condition());
+            if (!compiled.ok()) {
+              throw Expr::CelException(
+                  absl::StrCat("failed to create an expression: ", compiled.status().message()));
             }
-            cel::expr::Expr new_expr;
-            if (!new_expr.ParseFromString(serialized)) {
-              throw EnvoyException("Failed to convert RBAC policy condition to new format");
-            }
-            return new_expr;
+            return std::move(compiled.value());
           }
-          return cel::expr::Expr{};
-        }()) {
-    if (policy.has_condition()) {
-      expr_ = Expr::createExpression(*builder, condition_);
-    }
-  }
+          return {};
+        }()) {}
 
   bool matches(const Network::Connection& connection, const Envoy::Http::RequestHeaderMap& headers,
                const StreamInfo::StreamInfo&) const override;
@@ -226,8 +222,7 @@ public:
 private:
   const OrMatcher permissions_;
   const OrMatcher principals_;
-  const cel::expr::Expr condition_;
-  Expr::ExpressionPtr expr_;
+  const absl::optional<Expr::CompiledExpression> expr_;
 };
 
 class MetadataMatcher : public Matcher {
